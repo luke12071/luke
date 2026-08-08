@@ -59,7 +59,7 @@
 
 ```bash
 # 方式一：从路由器/内网下载后执行
-curl -o install-devmon.sh http://192.168.0.226/download/install-devmon.sh
+curl -o install-devmon.sh https://github.com/luke12071/luke/blob/main/version%E7%9B%91%E6%8E%A7sh/v5/install-devmon.sh
 sudo bash install-devmon.sh          # 默认端口 8080
 # 或指定端口
 sudo bash install-devmon.sh 9000
@@ -258,7 +258,7 @@ cat /var/lib/devmon/collect.log
 ## 7. 卸载
 
 ```bash
-curl -o uninstall-devmon.sh http://192.168.0.226/download/uninstall-devmon.sh
+curl -o uninstall-devmon.sh https://github.com/luke12071/luke/blob/main/version%E7%9B%91%E6%8E%A7sh/v5/uninstall-devmon.sh
 sudo bash uninstall-devmon.sh
 ```
 
