@@ -292,4 +292,3 @@ sudo bash uninstall-devmon.sh
 | `fix-devmon.sh` | `c558d1637bd6cfbdcd27331f7a358f63` |
 | `uninstall-devmon.sh` | `02f1b74fe61a05124ac32c041a24c4f7` |
 
-下载地址：`http://192.168.0.226/download/<文件名>`
