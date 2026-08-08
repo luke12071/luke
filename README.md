@@ -3,292 +3,190 @@
 # DevMon 使用与维护文档
 <img width="1170" height="370" alt="截屏2026-08-08 12 21 55" src="https://github.com/user-attachments/assets/ec00ad5c-7489-4a3c-b5ad-0d5bd223300f" />
 
-
-轻量设备监控系统（Ubuntu 24.04 + Web 管理页面），v5。
-
-目标场景：Ubuntu 云服务器，监控**谁在连这台服务器**——在线设备、系统/型号（尽力而为嗅探）、地点、连接时长、传输协议、代理服务、上下行流量、本机 DNS 统计，并有登录保护的管理页面。
-
----
-
-## 1. 组件与文件清单
-
-| 文件 | 作用 |
-|---|---|
-| `/usr/local/bin/devmon.sh` | 采集器 v5：设备发现、时长、流量、GeoIP、协议、服务映射、设备信息合并、DNS 统计，输出 JSON |
-| `/usr/local/bin/devmon-sniff.py` | 设备信息嗅探器 v1：抓入站首个数据包，解析 HTTP UA 与 TLS SNI/JA3 |
-| `/usr/local/bin/devmon-web.py` | Web 管理页面 v5（登录鉴权 + 管理页 + JSON API） |
-| `/usr/local/bin/devmon-passwd.sh` | 修改 Web 登录密码 |
-| `/usr/local/bin/enable-dnslog.sh` | 开启本机 DNS 请求统计（dnsmasq 抓取） |
-| `/usr/local/bin/disable-dnslog.sh` | 关闭并回滚 DNS 统计配置 |
-| `/etc/systemd/system/devmon-web.service` | Web 服务（systemd） |
-| `/etc/systemd/system/devmon-sniff.service` | 嗅探服务（systemd） |
-| `/etc/nftables.netmon` | nftables 流量记账表（开机由 crontab 恢复） |
-
-### 数据文件（`/var/lib/devmon/`）
-
-| 文件 | 内容 |
-|---|---|
-| `devices.json` | 采集结果（页面/API 直接读取） |
-| `deviceinfo` | 嗅探结果 TSV：`IP  系统  型号  最近访问域名  最后活动时间` |
-| `ja3db` | JA3 指纹 → 客户端/系统 映射库（可编辑） |
-| `services` | 端口 → 服务名 映射（如 `8388 ss`） |
-| `names` | IP → 设备名 映射（可编辑） |
-| `geo.cache` | GeoIP 定位缓存（24 小时有效） |
-| `state` | 连接时长兜底的 first_seen 记录 |
-| `collect.log` | 采集器错误日志 |
-
-### 安全文件
-
-| 文件 | 内容 |
-|---|---|
-| `/etc/devmon.auth` | 登录账号（用户名/盐/迭代/哈希，PBKDF2-SHA256，权限 600） |
-| `/etc/devmon.token` | 旧式 API 备用 token（URL `?token=` 或 `X-Token` 头） |
+版本: v6 (2026-08-08 更新)
+适用系统: Ubuntu 24.04 (需 root)
+管理页面: `http://<本机IP>:<端口>/` (默认端口 8080)
 
 ---
 
-## 2. 安装
+## 1. 本次更新内容 (v5 → v6)
 
-### 2.1 前置条件
+### 1.1 修复: 流量数据未采集
+- 根因: 旧版 nftables `netmon` 计数表使用 `ip saddr @up` 查询一个从未填充的 map，且该内核
+  不支持动态计数器 (`update`/`add` 返回 "Operation not supported")，导致上/下行永远为 0。
+- 方案: 流量统计改由嗅探器 `devmon-sniff.py` (AF_PACKET 原始套接字) 按 IP 直接统计，
+  每 5 秒写入 `/var/lib/devmon/traffic`；采集器优先读取该文件，nft 仅作兜底。
+- 效果: 设备级上/下行、总上/下行均正常显示。
 
-- Ubuntu 24.04（其他版本会提示但可继续尝试）
-- root 权限，可联网（GeoIP 查询、apt 安装）
-- 云端安全组需放行 Web 端口（默认 `8080/tcp`）
-- 需要 `nftables`、`python3`（Ubuntu 自带）
+### 1.2 优化: IP 位置显示
+- 新增 `/var/lib/devmon/geofix` 手工修正文件，优先级最高 (可把机房/CDN IP 标成真实位置)。
+- 定位主源 `ip-api.com`，失败自动切换 `ipinfo.io` 备用，并把国家代码翻译成中文。
+- 失败缓存缩短为 10 分钟自动重试；成功缓存 24 小时。
+- 位置后附加 ISP/ASN 名称 (如 `[Cloudflare, Inc.]`)，便于识别 CDN / 云服务商。
 
-### 2.2 执行安装
+### 1.3 新增: 设备端口 > 服务器端口
+- 采集 conntrack 中每个连接的 `本机端口>服务器端口`，页面新增"端口(本机>服务器)"列，
+  每台设备最多展示 20 组。
 
-```bash
-# 方式一：从路由器/内网下载后执行
-curl -o install-devmon.sh https://github.com/luke12071/luke/blob/main/version%E7%9B%91%E6%8E%A7sh/v5/install-devmon.sh
-sudo bash install-devmon.sh          # 默认端口 8080
-# 或指定端口
-sudo bash install-devmon.sh 9000
-```
+### 1.4 新增: 路由追踪 (traceroute)
+- 页面每行外网设备新增"路由"按钮，弹出窗口逐跳显示路由路径。
+- 后端 `/api/trace?ip=...` 调用 `traceroute` (已随安装自动安装)，结果缓存 30 分钟。
 
-安装脚本依次执行：系统检查 → 安装依赖（conntrack/curl/jq）→ 初始化 nftables 记账表 → 安装采集器 → 生成映射模板 → 安装嗅探器 + systemd 服务 → 安装 Web 页面 + DNS 日志/改密工具 → 启动服务。
+### 1.5 优化: 代理协议识别更广
+- 采集器自动读取 daed 节点库 `/etc/daed/wing.db`，按节点端口自动识别
+  `trojan-go` / `vless-reality` / `vless-grpc` / `vmess` 等协议。
+- 嗅探器新增应用协议检测:
+  - `anytls`: TLS ClientHello 中 ALPN 含 `itls`
+  - `quic/h3`: UDP QUIC v1/v2 长包头 (可覆盖 hysteria2 / HTTP/3)
+- `/var/lib/devmon/services` 模板扩展了 anytls / hysteria2 / ss / socks5 等示例端口。
 
-安装结束会打印：
+---
 
-```
-管理页面: http://<服务器IP>:8080/    (需要登录)
-登录账号: admin
-登录密码: <随机生成的密码>           ← 首次安装自动生成
-```
-
-### 2.3 首次登录
-
-1. 浏览器打开 `http://<服务器IP>:8080/`
-2. 用 `admin` + 安装时打印的密码登录
-3. 页面每 5 秒自动刷新（首次打开会触发采集器运行）
-
-### 2.4 安装后自检
+## 2. 安装 / 重新安装
 
 ```bash
-systemctl status devmon-web devmon-sniff     # 两个服务应 active
-jq -r '.devices[].ip' /var/lib/devmon/devices.json   # 已有在线设备
-cat /var/lib/devmon/deviceinfo                # 嗅探到的设备信息
+sudo bash install-devmon.sh [端口]      # 默认 8080
+```
+
+安装过程:
+1. 系统检查 (需 root + nftables)
+2. 安装依赖 `conntrack curl jq traceroute`
+3. 初始化流量统计 (删除旧 nftables netmon 表，改为嗅探器采集)
+4. 安装采集器 `devmon.sh` + 嗅探器 `devmon-sniff.py` (systemd 服务)
+5. 安装 Web 页面 `devmon-web.py` (systemd 服务)
+6. 启动并输出: 管理地址、初始密码、token、数据/日志路径
+
+安装完成后页面提示中的随机密码只显示一次，用以下命令修改:
+
+```bash
+sudo bash devmon-passwd.sh [用户名]     # 默认 admin
 ```
 
 ---
 
-## 3. 使用指南
+## 3. 页面功能
 
-### 3.1 Web 页面
+| 列 | 说明 |
+|----|------|
+| 设备 | 设备名或 IP (可在 `names` 文件命名) |
+| 设备系统 | 嗅探到的 OS/型号 (HTTP User-Agent / JA3 指纹) |
+| 最近访问 | 嗅探到的访问域名 (TLS SNI) |
+| 地点 | GeoIP 位置，含 ISP |
+| 连接时长 | conntrack 或 first_seen 计算 |
+| 传输协议 | tcp / udp / sctp / gre |
+| 代理协议/服务 | 端口映射 + 嗅探识别 (vless/trojan/anytls/hysteria2…) |
+| 端口(本机>服务器) | 设备端口到服务器端口的连接对 |
+| 上行 / 下行 | 该 IP 发送 / 接收的字节数 |
+| 路由 | 点击弹出 traceroute 逐跳路径 (外网设备) |
 
-| 栏目 | 说明 |
-|---|---|
-| 顶部卡片 | 在线设备数、总上行、总下行 |
-| 设备表 | 设备名/IP、系统与型号、最近访问域名、地点、连接时长、传输协议、服务、上行、下行 |
-| 筛选 | 全部 / 内网 / 外网（按 IP 段判断） |
-| DNS TOP | 本机 DNS 请求统计（需先启用 enable-dnslog.sh） |
+顶部卡片: 在线设备数、局域网总上行、局域网总下行 (均为内网口径)。
+"全部 / 内网 / 外网" 筛选; 5 秒自动刷新。
 
-设备名显示优先级：`names` 映射 > 嗅探到的型号 > IP。
+---
 
-### 3.2 给设备命名
+## 4. 配置文件 (可手工编辑，改完自动生效)
 
-```bash
-sudo nano /var/lib/devmon/names
-# 格式: IP 设备名   （# 开头为注释）
-203.0.113.5 我的手机
+### 4.1 `/var/lib/devmon/services` — 端口 → 协议
 ```
-改完刷新页面即生效。
-
-### 3.3 标注代理服务
-
-```bash
-sudo nano /var/lib/devmon/services
-# 格式: 端口 服务名   （# 开头为注释）
+# 端口 服务名
+80 vmess
 443 vless
+4433 hysteria2
 8388 ss
 8443 trojan
+8881 vless-reality
+8886 trojan-go
+8890 vless-grpc
+10086 anytls
+1080 socks5
+2053 hysteria2
 ```
-设备连到对应端口时，页面"服务"列会显示该标签。默认模板已含 3 个常见项。
+daed 节点端口会自动识别，此处用于补充自定义代理端口 (如 ss / hysteria2 / anytls)。
 
-### 3.4 修改登录密码
-
-```bash
-sudo bash devmon-passwd.sh          # 修改 admin 密码
-sudo bash devmon-passwd.sh alice    # 或设置其他用户名
+### 4.2 `/var/lib/devmon/names` — IP → 设备名
 ```
-
-### 3.5 开启本机 DNS 统计
-
-```bash
-sudo bash enable-dnslog.sh
-```
-原理：本机 DNS 查询由 `dnsmasq(127.0.0.1:53)` 代理并记日志，systemd-resolved 上游指向它，日志落到 `/var/log/dnsmasq.log`，页面自动展示 TOP 25。回滚：
-
-```bash
-sudo bash disable-dnslog.sh
-```
-（会备份并还原 `/etc/systemd/resolved.conf`。）
-
-### 3.6 旧版 API（备用入口）
-
-- URL：`http://<IP>:8080/?token=<TOKEN>` 或
-- 请求头：`X-Token: <TOKEN>`，TOKEN 见 `/etc/devmon.token`
-- 数据接口：`GET /api/devices`（返回 devices.json）
-
----
-
-## 4. 功能实现原理
-
-### 4.1 在线设备发现
-
-- **conntrack** 优先：解析连接表里的 `src=IP dport=端口`，同时得到传输协议（tcp/udp/sctp/gre）
-- **ss** 兜底：`ss -tnH` 里远端 IP 非本机/非 0.0.0.0 的已建立连接
-
-### 4.2 连接时长
-
-- 优先用 conntrack 的 `[START]` 时间戳（需内核开启 `CONFIG_NF_CONNTRACK_TIMESTAMP`）
-- 不支持时用 `first_seen` 状态文件兜底
-- 设备从连接表消失 10 分钟后时长重置
-
-### 4.3 上下行流量
-
-- 安装时建立 nftables `inet netmon` 表（`up`/`down` 两个 map + counter）
-- 每台设备的上行/下行累计字节数由内核计数，采集时读表即可，不额外抓包
-
-### 4.4 地理位置
-
-- 内网 IP（`10./192.168./172.16-31./100.64-127./127./169.254.`）直接标记"内网"
-- 公网 IP 查询 `http://ip-api.com/json/<IP>?lang=zh-CN`，结果缓存 24 小时到 `geo.cache`
-
-### 4.5 传输协议与代理服务识别
-
-- 协议：conntrack 记录的 tcp/udp 等
-- 服务：按"本地端口"对照 `services` 文件，标注 vless/ss/trojan 等
-
-### 4.6 设备系统/型号嗅探（尽力而为）
-
-嗅探器监听所有网卡的入站 TCP **首个数据包**，不做持续抓包：
-
-| 流量类型 | 解析内容 |
-|---|---|
-| HTTP 明文 | User-Agent → 系统/型号（iOS/Android/Windows/macOS/Linux/curl） |
-| TLS 握手 | SNI（访问域名） + JA3 指纹（对照 `ja3db` 推断客户端） |
-
-- 结果写入 `deviceinfo`，采集器合并进 `devices.json`
-- JA3 实现符合规范：握手版本转十进制、过滤 GREASE 值（RFC 8701）、扩展按出现顺序十进制
-- `ja3db` 可编辑扩充：查真实指纹 https://ja3er.com 后回填
-
-> **重要限制**：vless/ss/trojan 等加密隧道内部的流量无法解析（只能看到"连到哪个端口"，看不到里层内容）。系统/型号识别依赖 HTTP UA 或 TLS SNI+JA3，属尽力而为，不是 100% 准确。
-
-### 4.7 本机 DNS 统计
-
-- dnsmasq 独立配置（只监听 127.0.0.1，不影响局域网解析）
-- `log-queries` 记所有查询到 `/var/log/dnsmasq.log`
-- 上游公共 DNS：223.5.5.5 / 119.29.29.29 / 1.1.1.1 / 8.8.8.8
-
-### 4.8 登录安全
-
-- 密码：PBKDF2-SHA256，20 万次迭代，随机盐，存 `/etc/devmon.auth`（600 权限）
-- 登录：表单 POST `/login`，成功后下发 `HttpOnly + SameSite` 会话 Cookie，7 天有效
-- 登出：`/logout` 同时失效服务端会话
-- 页面/API 未登录一律 302 到登录页
-- 旧 `?token=` 作为 API 备用通道保留
-
----
-
-## 5. 升级与修复
-
-```bash
-curl -o fix-devmon.sh http://192.168.0.226/download/fix-devmon.sh
-sudo bash fix-devmon.sh
+# IP 设备名
+192.168.0.137 客厅电视
 ```
 
-`fix-devmon.sh` 用于版本升级（v4 → v5）：
-- 覆盖采集器与 Web 页面到 v5
-- 安装/更新嗅探器与 systemd 服务
-- 生成 `ja3db` 模板（已存在则不覆盖）
-- 不覆盖你已有的 `names`、`services`、`/etc/devmon.auth` 配置
-- 结束打印自检结果
+### 4.3 `/var/lib/devmon/geofix` — IP → 手工定位 (优先级最高)
+```
+# IP 地点 类如
+8.8.8.8 美国 圣路易斯 [CYBERCON]
+```
 
-升级前建议先备份配置：
-
-```bash
-sudo cp -r /var/lib/devmon /var/lib/devmon.bak.$(date +%F)
-sudo cp /etc/devmon.auth /etc/devmon.auth.bak
+### 4.4 `/var/lib/devmon/ja3db` — JA3 TLS 指纹 → 系统
+```
+# <32位ja3> 说明
+13d6c21643a4d76c419bc34706a949d0 Linux curl (OpenSSL)
 ```
 
 ---
 
-## 6. 常见问题与排错
+## 5. 日常维护
+
+### 5.1 查看状态与日志
+```bash
+systemctl status devmon-web devmon-sniff      # 两个服务状态
+journalctl -u devmon-web -f                    # Web 日志
+cat /var/lib/devmon/collect.log                # 采集器错误日志
+```
+
+### 5.2 手动刷新数据
+```bash
+sudo /usr/local/bin/devmon.sh
+```
+
+### 5.3 重启服务
+```bash
+sudo systemctl restart devmon-web devmon-sniff
+```
+
+### 5.4 数据文件
+| 文件 | 说明 |
+|------|------|
+| `/var/lib/devmon/devices.json` | 页面 API 数据 (每次刷新生成) |
+| `/var/lib/devmon/traffic` | 按 IP 上/下行字节累计 (嗅探器每 5s 写) |
+| `/var/lib/devmon/deviceinfo` | 设备 OS/型号/最近访问 (3 天过期) |
+| `/var/lib/devmon/protocols` | 嗅探识别的应用协议 |
+| `/var/lib/devmon/geo.cache` | GeoIP 缓存 (超 3000 行自动裁剪) |
+| `/var/lib/devmon/traces.json` | traceroute 缓存 (30 分钟) |
+| `/var/lib/devmon/state` | 时长状态文件 (设备消失 10 分钟重置) |
+
+### 5.5 登录与授权
+- 登录: `sudo bash devmon-passwd.sh` 设置账号密码。
+- 免登录 token (适合脚本调用):
+  `http://<IP>:<PORT>/api/devices?token=$(cat /etc/devmon.token)`
+  或请求头 `X-Token: <token>`。
+- API 端点: `/api/devices` (设备列表), `/api/trace?ip=<IP>` (路由追踪)。
+
+### 5.6 可选: 本机 DNS 请求统计
+```bash
+sudo bash enable-dnslog.sh       # 开启 (页面显示 DNS TOP)
+sudo bash disable-dnslog.sh      # 回滚
+```
+
+### 5.7 可选: 防火墙放行
+```bash
+sudo ufw allow <端口>/tcp         # 管理页面端口
+```
+
+---
+
+## 6. 故障排查
 
 | 现象 | 排查 |
-|---|---|
-| 页面打开转登录页 | 密码在 `/etc/devmon.auth`，用 `devmon-passwd.sh` 重设 |
-| 没有设备数据 | `systemctl status devmon-web`；`cat /var/lib/devmon/collect.log`；确认 conntrack/ss 可用 |
-| 嗅探不到系统/型号 | `systemctl status devmon-sniff`（需 root/CAP_NET_RAW）；加密隧道流量本就看不了；等 5 秒落盘 `deviceinfo` |
-| 流量一直是 0 | `nft list map inet netmon up` 是否存在；不存在则重跑安装脚本 |
-| 时长不准确 | conntrack 无 `[START]` 时会退化为 first_seen 近似值 |
-| 地点显示"-" | 服务器无法访问 ip-api.com，或缓存过期（24h） |
-| DNS 列表空 | 未执行 `enable-dnslog.sh`，或 `/var/log/dnsmasq.log` 无权限读 |
+|------|------|
+| 流量全为 0 | `ls -l /var/lib/devmon/traffic` 看 mtime 是否 <30s；`systemctl status devmon-sniff` |
+| 位置显示 "-" | 10 分钟后自动重试；或在 `geofix` 手工填写 |
+| 协议列空白 | 检查 `services`/daed 节点端口是否正确；等嗅探器识别 (anytls/quic) |
+| traceroute 无结果 | 确认已装 `traceroute`；目标屏蔽 ICMP/UDP 属正常，可看其它跳 |
+| 页面登录不了 | 用 token 方式访问确认服务正常，再 `devmon-passwd.sh` 重置密码 |
 
-**通用排错**：先看两个服务的状态与日志，再读 `collect.log`：
+---
 
-```bash
-systemctl status devmon-web devmon-sniff
-journalctl -u devmon-web -n 20 --no-pager
-cat /var/lib/devmon/collect.log
+## 7. 本包内容
 ```
-
----
-
-## 7. 卸载
-
-```bash
-curl -o uninstall-devmon.sh https://github.com/luke12071/luke/blob/main/version%E7%9B%91%E6%8E%A7sh/v5/uninstall-devmon.sh
-sudo bash uninstall-devmon.sh
+install-devmon.sh                  # 一键安装脚本 (v6)
+DevMon-维护手册.md                 # 本文档
 ```
-
-卸载内容：
-- 停止并删除 `devmon-web`、`devmon-sniff` 两个 systemd 服务
-- 删除全部脚本（采集器/嗅探器/Web/改密/DNS 日志工具）
-- 删除 `/etc/devmon.auth`、`/etc/devmon.token`
-- 删除 `/var/lib/devmon` 全部数据（含你的映射配置，**卸载前先备份**）
-- 删除 nftables `netmon` 表与 `crontab` 开机记录
-- 可选询问是否卸载 `conntrack`（默认保留）
-- 自动检测并回滚 DNS 日志配置
-
-> 该卸载器**只适用于 systemd 系（Debian/Ubuntu）**，且**只针对 DevMon**。不要拿到 OpenWrt/iStoreOS 上跑。
-
----
-
-## 8. 安全注意事项
-
-- Web 页面**未启用 HTTPS**：数据（含登录会话）走明文。建议用安全组把 `8080/tcp` 限制到你的来源 IP
-- 嗅探器以 root 运行（AF_PACKET raw socket 需要 root 或 CAP_NET_RAW）
-- `deviceinfo`/`devices.json` 含设备访问过的域名（SNI/Host），注意不要外泄
-- 更新 `ja3db` 时只放可信来源的指纹
-
----
-
-## 9. 发布版本（路由器 /www/download）
-
-| 文件 | 校验和 (md5) |
-|---|---|
-| `install-devmon.sh` | `8c750a75a9836fecfb6fe563c2b661d0` |
-| `fix-devmon.sh` | `c558d1637bd6cfbdcd27331f7a358f63` |
-| `uninstall-devmon.sh` | `02f1b74fe61a05124ac32c041a24c4f7` |
-
